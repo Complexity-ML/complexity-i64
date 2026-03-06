@@ -1,0 +1,13 @@
+source: streaming                # streaming or pretokenized
+
+# Streaming (HuggingFace)
+dataset: HuggingFaceFW/fineweb-edu
+text_field: text
+# subset: null
+# exclude_sources: []
+
+# Pre-tokenized (parquet shards)
+# data_dir: ./pretokenized
+
+max_length: 2048
+num_workers: 4

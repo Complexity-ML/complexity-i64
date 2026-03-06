@@ -1,37 +1,20 @@
 model:
-  size: 150m
   vocab_size: 32000
-
-data:
-  source: streaming          # streaming or pretokenized
-  dataset: roneneldan/TinyStories
-  text_field: text
-  max_length: 512
-  num_workers: 4
-
-training:
-  batch_size: 32
-  gradient_accumulation: 1
-  max_steps: 100000
-  learning_rate: 1e-4
-  weight_decay: 0.1
-  max_grad_norm: 1.0
-
-  # Scheduler
-  scheduler: cosine          # cosine, constant, cosine_restarts
-  warmup_steps: 2000
-  restart_period: 50000
-  restart_mult: 2
-
-  # Precision
-  bf16: false
-  use_amp: true
-
-  # Logging
-  log_interval: 50
-  save_interval: 5000
-
-paths:
-  tokenizer: ./tokenizer
-  checkpoint_dir: ./checkpoints
-  tensorboard_dir: ./runs
+  hidden_size: 2048
+  intermediate_size: 5632
+  num_hidden_layers: 24
+  num_attention_heads: 16
+  num_key_value_heads: 8
+  max_position_embeddings: 2048
+  rope_theta: 10000.0
+  rms_norm_eps: 1e-6
+  tie_word_embeddings: true
+  use_token_routed_mlp: true
+  num_experts: 4
+  use_qk_norm: true
+  use_sdpa: true
+  dynamics_alpha: 0.9
+  dynamics_beta: 0.1
+  dynamics_gate: 0.5
+  dynamics_dt: 0.1
+  dynamics_controller_hidden: 64

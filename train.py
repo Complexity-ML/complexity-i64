@@ -4,11 +4,10 @@ Complexity-I64 :: Pre-Training Script
 Train an I64 model from scratch in float32.
 After training, call model.quantize_all() for INT8 inference.
 
-All parameters come from YAML config. No hardcoded values.
-
 Usage:
-    python train.py --config configs/pretrain/default.yaml
-    python train.py --config configs/pretrain/default.yaml --resume ./checkpoints/last.pt
+    python train.py --model configs/pretrain/default.yaml \
+                    --data configs/data/pretrain.yaml \
+                    --lr 3e-5 --batch-size 32
 
 INL - 2025
 """
@@ -24,7 +23,8 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerFast, AutoTokenizer
 
-from complexity_i64.models.modeling import create_i64_model
+from complexity_i64.models.modeling import I64Model
+from complexity_i64.models.config import I64Config
 from complexity_i64.data.datasets import (
     PreTokenizedDataset,
     StreamingTextDataset,
@@ -43,20 +43,51 @@ logger = logging.getLogger("complexity_i64.train")
 
 def main():
     parser = argparse.ArgumentParser(description="Train Complexity-I64")
-    parser.add_argument("--config", type=str, required=True, help="YAML config file")
-    parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
+
+    # Configs
+    parser.add_argument("--model", type=str, required=True,
+                        help="Model architecture YAML (configs/pretrain/default.yaml)")
+    parser.add_argument("--data", type=str, required=True,
+                        help="Dataset YAML (configs/data/pretrain.yaml)")
+
+    # Training (CLI)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--gradient-accumulation", type=int, default=1)
+    parser.add_argument("--max-steps", type=int, default=100000)
+    parser.add_argument("--lr", type=float, default=3e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--warmup-steps", type=int, default=2000)
+    parser.add_argument("--scheduler", type=str, default="cosine",
+                        choices=["cosine", "constant", "cosine_restarts"])
+
+    # Precision
+    parser.add_argument("--bf16", action="store_true")
+    parser.add_argument("--no-amp", action="store_true")
+
+    # Paths
+    parser.add_argument("--tokenizer", type=str, default="./tokenizer")
+    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints")
+    parser.add_argument("--tensorboard-dir", type=str, default="./runs")
+    parser.add_argument("--log-interval", type=int, default=50)
+    parser.add_argument("--save-interval", type=int, default=5000)
+
+    # Resume
+    parser.add_argument("--resume", type=str, default=None)
+
+    # Other
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--token", type=str, default=None, help="HuggingFace token")
+
     args = parser.parse_args()
 
-    # Load config
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
+    # Load model config
+    with open(args.model) as f:
+        model_yaml = yaml.safe_load(f)["model"]
 
-    model_cfg = cfg["model"]
-    data_cfg = cfg["data"]
-    train_cfg = cfg["training"]
-    paths_cfg = cfg["paths"]
+    # Load data config
+    with open(args.data) as f:
+        data_yaml = yaml.safe_load(f)
 
     # Device
     if args.device == "auto":
@@ -64,110 +95,101 @@ def main():
     else:
         device = torch.device(args.device)
 
-    logger.info("Config: %s", args.config)
+    logger.info("Model config: %s", args.model)
+    logger.info("Data config: %s", args.data)
     logger.info("Device: %s", device)
     if torch.cuda.is_available():
         logger.info("GPU: %s", torch.cuda.get_device_name())
 
     # Tokenizer
-    tokenizer_path = paths_cfg["tokenizer"]
-    if os.path.exists(tokenizer_path):
-        tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_path)
+    if os.path.exists(args.tokenizer):
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(args.tokenizer)
     else:
-        logger.warning("Tokenizer not found at %s, using GPT-2", tokenizer_path)
+        logger.warning("Tokenizer not found at %s, using GPT-2", args.tokenizer)
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
-    vocab_size = model_cfg.get("vocab_size", len(tokenizer))
-    logger.info("Vocab size: %d", vocab_size)
+    logger.info("Vocab size: %d", len(tokenizer))
 
-    # Model
-    model = create_i64_model(size=model_cfg["size"], vocab_size=vocab_size)
+    # Model from YAML config
+    config = I64Config.from_dict(model_yaml)
+    config.vocab_size = model_yaml.get("vocab_size", len(tokenizer))
+    model = I64Model(config)
     model = model.to(device)
     logger.info("Parameters: %d", model.num_parameters())
 
     # Optimizer & scheduler
-    optimizer = create_optimizer(
-        model,
-        lr=train_cfg["learning_rate"],
-        weight_decay=train_cfg.get("weight_decay", 0.1),
-    )
+    optimizer = create_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = create_scheduler(
         optimizer,
-        scheduler_type=train_cfg.get("scheduler", "cosine"),
-        warmup_steps=train_cfg.get("warmup_steps", 500),
-        max_steps=train_cfg.get("max_steps", 100000),
-        restart_period=train_cfg.get("restart_period", 50000),
-        restart_mult=train_cfg.get("restart_mult", 2),
+        scheduler_type=args.scheduler,
+        warmup_steps=args.warmup_steps,
+        max_steps=args.max_steps,
     )
 
     # Dataset
-    source = data_cfg.get("source", "streaming")
+    source = data_yaml.get("source", "streaming")
+    max_length = data_yaml.get("max_length", 512)
+
     if source == "pretokenized":
-        train_dataset = PreTokenizedDataset(
-            data_cfg["data_dir"],
-            max_length=data_cfg.get("max_length", 512),
-        )
+        train_dataset = PreTokenizedDataset(data_yaml["data_dir"], max_length=max_length)
         train_loader = DataLoader(
             train_dataset,
-            batch_size=train_cfg["batch_size"],
+            batch_size=args.batch_size,
             shuffle=True,
             collate_fn=collate_fn,
-            num_workers=data_cfg.get("num_workers", 4),
+            num_workers=data_yaml.get("num_workers", 4),
             pin_memory=True,
         )
     else:
         train_dataset = StreamingTextDataset(
-            dataset_name=data_cfg["dataset"],
+            dataset_name=data_yaml["dataset"],
             tokenizer=tokenizer,
-            max_length=data_cfg.get("max_length", 512),
-            text_field=data_cfg.get("text_field", "text"),
+            max_length=max_length,
+            text_field=data_yaml.get("text_field", "text"),
+            subset=data_yaml.get("subset", None),
+            exclude_sources=data_yaml.get("exclude_sources", None),
             token=args.token,
         )
         train_loader = DataLoader(
             train_dataset,
-            batch_size=train_cfg["batch_size"],
+            batch_size=args.batch_size,
             collate_fn=collate_fn,
             num_workers=0,
         )
 
     # Trainer
-    run_name = f"i64_{model_cfg['size']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_name = f"i64_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     trainer = Trainer(
         model=model,
         optimizer=optimizer,
         scheduler=scheduler,
         device=device,
-        checkpoint_dir=paths_cfg.get("checkpoint_dir", "./checkpoints"),
-        log_dir=paths_cfg.get("tensorboard_dir", "./runs"),
+        checkpoint_dir=args.checkpoint_dir,
+        log_dir=args.tensorboard_dir,
         run_name=run_name,
-        use_amp=train_cfg.get("use_amp", True),
-        bf16=train_cfg.get("bf16", False),
-        gradient_accumulation=train_cfg.get("gradient_accumulation", 1),
-        max_grad_norm=train_cfg.get("max_grad_norm", 1.0),
-        log_interval=train_cfg.get("log_interval", 50),
-        save_interval=train_cfg.get("save_interval", 5000),
+        use_amp=not args.no_amp,
+        bf16=args.bf16,
+        gradient_accumulation=args.gradient_accumulation,
+        max_grad_norm=args.max_grad_norm,
+        log_interval=args.log_interval,
+        save_interval=args.save_interval,
     )
 
     # Resume
     start_step = 0
     if args.resume:
-        start_step = trainer.resume(args.resume, lr=train_cfg["learning_rate"])
+        start_step = trainer.resume(args.resume, lr=args.lr)
 
-    # Train
-    logger.info("Starting training — batch=%d, grad_accum=%d, max_steps=%d",
-                train_cfg["batch_size"],
-                train_cfg.get("gradient_accumulation", 1),
-                train_cfg.get("max_steps", 100000))
+    logger.info("Starting training — batch=%d, grad_accum=%d, lr=%.2e, max_steps=%d",
+                args.batch_size, args.gradient_accumulation, args.lr, args.max_steps)
 
     final_step = trainer.train(
         train_loader,
-        max_steps=train_cfg.get("max_steps", 100000),
+        max_steps=args.max_steps,
         start_step=start_step,
     )
 
-    # Save final
-    checkpoint_dir = paths_cfg.get("checkpoint_dir", "./checkpoints")
-    model.save_pretrained(str(Path(checkpoint_dir) / "final"))
+    model.save_pretrained(str(Path(args.checkpoint_dir) / "final"))
     logger.info("Training complete! Final step: %d", final_step)
 
 
