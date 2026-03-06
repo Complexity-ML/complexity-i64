@@ -149,6 +149,7 @@ class I64Model(nn.Module):
     def __init__(self, config: I64Config):
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = False
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
 
@@ -168,6 +169,13 @@ class I64Model(nn.Module):
             pass
 
         self.apply(self._init_weights)
+
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing to save VRAM (recomputes activations during backward)."""
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
 
     def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
@@ -208,14 +216,23 @@ class I64Model(nn.Module):
 
         for i, layer in enumerate(self.layers):
             pkv = past_key_values[i] if past_key_values else None
-            hidden, velocity, mu_current, new_kv = layer(
-                hidden, positions, velocity,
-                token_ids=input_ids,
-                mu_prev=mu_prev,
-                attention_mask=attention_mask,
-                past_key_value=pkv,
-                use_cache=use_cache,
-            )
+
+            if self.gradient_checkpointing and self.training and not use_cache:
+                hidden, velocity, mu_current, new_kv = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    hidden, positions, velocity, input_ids, mu_prev,
+                    attention_mask, pkv, use_cache,
+                    use_reentrant=False,
+                )
+            else:
+                hidden, velocity, mu_current, new_kv = layer(
+                    hidden, positions, velocity,
+                    token_ids=input_ids,
+                    mu_prev=mu_prev,
+                    attention_mask=attention_mask,
+                    past_key_value=pkv,
+                    use_cache=use_cache,
+                )
 
             # Mu Residual Highway (EMA + norm clamp to prevent divergence)
             if mu_residual is None:

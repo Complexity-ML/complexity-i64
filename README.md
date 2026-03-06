@@ -35,13 +35,30 @@ Complexity-I64 projects the [Complexity-Deep](../complexity-deep/) architecture 
 pip install -e .
 ```
 
-### Pre-training
+### Pre-training (single GPU)
 
 ```bash
 python train.py \
     --model configs/pretrain/1b.yaml \
     --data configs/data/pretrain.yaml \
     --lr 3e-5 --batch-size 32 --max-steps 100000
+```
+
+### Pre-training (multi-GPU FSDP)
+
+```bash
+# 4 GPUs, gradient checkpointing, BF16
+torchrun --nproc_per_node=4 train.py \
+    --model configs/pretrain/3b.yaml \
+    --data configs/data/pretrain.yaml \
+    --lr 3e-5 --batch-size 8 --fsdp --bf16 --gradient-checkpointing
+
+# Multi-node (2 nodes x 4 GPUs)
+torchrun --nnodes=2 --nproc_per_node=4 \
+    --rdzv_backend=c10d --rdzv_endpoint=HEAD_NODE:29500 \
+    train.py --model configs/pretrain/7b.yaml \
+    --data configs/data/pretrain.yaml \
+    --fsdp --bf16 --gradient-checkpointing
 ```
 
 ### SFT (Conversational Fine-tuning)
@@ -98,6 +115,7 @@ complexity_i64/
         modeling.py        # I64Model (full causal LM)
     training/
         trainer.py         # Training loop (pre-train + SFT)
+        distributed.py     # FSDP multi-GPU/multi-node utilities
         utils.py           # Optimizer, scheduler, checkpoint utils
     data/
         datasets.py        # Streaming, pre-tokenized, conversational SFT

@@ -15,9 +15,12 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+
+from complexity_i64.training.distributed import is_main_process, reduce_mean
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +61,7 @@ class Trainer:
         max_grad_norm: float = 1.0,
         log_interval: int = 50,
         save_interval: int = 5000,
+        distributed: bool = False,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -67,28 +71,39 @@ class Trainer:
         self.max_grad_norm = max_grad_norm
         self.log_interval = log_interval
         self.save_interval = save_interval
+        self.distributed = distributed
 
         self.checkpoint_dir = Path(checkpoint_dir)
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        if is_main_process():
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # Mixed precision
-        self.use_amp = use_amp and AMP_AVAILABLE and torch.cuda.is_available()
-        if self.use_amp:
-            if bf16 and torch.cuda.is_bf16_supported():
-                self.amp_dtype = torch.bfloat16
-                self.scaler = None
-                logger.info("Using BF16 mixed precision")
-            else:
-                self.amp_dtype = torch.float16
-                self.scaler = GradScaler('cuda')
-                logger.info("Using FP16 mixed precision")
-        else:
+        # Mixed precision — FSDP handles its own mixed precision, skip GradScaler
+        if distributed:
+            self.use_amp = False
             self.amp_dtype = torch.float32
             self.scaler = None
-            logger.info("Using FP32 (no mixed precision)")
+            logger.info("FSDP mode — mixed precision handled by FSDP wrapper")
+        else:
+            self.use_amp = use_amp and AMP_AVAILABLE and torch.cuda.is_available()
+            if self.use_amp:
+                if bf16 and torch.cuda.is_bf16_supported():
+                    self.amp_dtype = torch.bfloat16
+                    self.scaler = None
+                    logger.info("Using BF16 mixed precision")
+                else:
+                    self.amp_dtype = torch.float16
+                    self.scaler = GradScaler('cuda')
+                    logger.info("Using FP16 mixed precision")
+            else:
+                self.amp_dtype = torch.float32
+                self.scaler = None
+                logger.info("Using FP32 (no mixed precision)")
 
-        # TensorBoard
-        self.writer = SummaryWriter(log_dir=str(Path(log_dir) / run_name))
+        # TensorBoard (only rank 0)
+        if is_main_process():
+            self.writer = SummaryWriter(log_dir=str(Path(log_dir) / run_name))
+        else:
+            self.writer = None
         self.global_step = 0
 
     def train(
@@ -104,7 +119,8 @@ class Trainer:
         self.global_step = start_step
         total_loss = 0.0
         start_time = time.time()
-        pbar = tqdm(total=max_steps, initial=start_step, desc="Training")
+        pbar = tqdm(total=max_steps, initial=start_step, desc="Training",
+                     disable=not is_main_process())
 
         self.optimizer.zero_grad()
         accum_loss = 0.0
@@ -241,14 +257,24 @@ class Trainer:
         self.optimizer.zero_grad()
 
     def _log_metrics(self, total_loss: float, start_time: float, batch: dict):
-        """Log to TensorBoard."""
+        """Log to TensorBoard (rank 0 only, with cross-rank loss sync)."""
         avg_loss = total_loss / self.log_interval
+
+        # Sync loss across ranks for accurate logging
+        if self.distributed:
+            loss_tensor = torch.tensor(avg_loss, device=self.device)
+            avg_loss = reduce_mean(loss_tensor).item()
+
+        if not is_main_process():
+            return
+
         elapsed = time.time() - start_time
         ppl = math.exp(avg_loss) if avg_loss < 20 else float('inf')
 
         batch_size = batch["input_ids"].shape[0]
         seq_len = batch["input_ids"].shape[1]
-        tokens_per_sec = (self.global_step * self.gradient_accumulation * batch_size * seq_len) / max(elapsed, 1)
+        world_size = dist.get_world_size() if self.distributed else 1
+        tokens_per_sec = (self.global_step * self.gradient_accumulation * batch_size * seq_len * world_size) / max(elapsed, 1)
 
         self.writer.add_scalar("train/loss", avg_loss, self.global_step)
         self.writer.add_scalar("train/perplexity", ppl, self.global_step)
@@ -289,7 +315,18 @@ class Trainer:
         self.writer.add_scalar("eval/perplexity", ppl, self.global_step)
 
     def _save_checkpoint(self, tag: Optional[str] = None):
-        """Save checkpoint."""
+        """Save checkpoint (FSDP-aware: gathers full state to rank 0)."""
+        if self.distributed:
+            from complexity_i64.training.distributed import save_fsdp_checkpoint
+            save_fsdp_checkpoint(
+                self.model, self.optimizer, self.scheduler,
+                self.global_step, str(self.checkpoint_dir), self.scaler,
+            )
+            return
+
+        if not is_main_process():
+            return
+
         name = tag or f"step_{self.global_step}"
         path = self.checkpoint_dir / f"{name}.pt"
 
@@ -307,31 +344,37 @@ class Trainer:
         logger.info("Saved checkpoint: %s", path)
 
     def resume(self, checkpoint_path: str, lr: Optional[float] = None):
-        """Resume training from checkpoint."""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        """Resume training from checkpoint (FSDP-aware)."""
+        if self.distributed:
+            from complexity_i64.training.distributed import load_fsdp_checkpoint
+            self.global_step = load_fsdp_checkpoint(
+                self.model, self.optimizer, checkpoint_path, device=self.device,
+            )
+        else:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
 
-        missing, unexpected = self.model.load_state_dict(
-            checkpoint["model_state_dict"], strict=False
-        )
-        if missing:
-            logger.info("New parameters: %d", len(missing))
-        if unexpected:
-            logger.warning("Unexpected keys: %d", len(unexpected))
+            missing, unexpected = self.model.load_state_dict(
+                checkpoint["model_state_dict"], strict=False
+            )
+            if missing:
+                logger.info("New parameters: %d", len(missing))
+            if unexpected:
+                logger.warning("Unexpected keys: %d", len(unexpected))
 
-        try:
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        except ValueError:
-            logger.warning("Optimizer structure changed, using fresh optimizer")
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            except ValueError:
+                logger.warning("Optimizer structure changed, using fresh optimizer")
 
-        self.global_step = checkpoint["step"]
+            self.global_step = checkpoint.get("step", 0)
+
+            if self.scaler and "scaler_state_dict" in checkpoint:
+                self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
         if lr is not None:
             for pg in self.optimizer.param_groups:
                 pg['lr'] = lr
                 pg['initial_lr'] = lr
-
-        if self.scaler and "scaler_state_dict" in checkpoint:
-            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
         logger.info("Resumed at step %d", self.global_step)
         return self.global_step

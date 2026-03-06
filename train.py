@@ -4,10 +4,22 @@ Complexity-I64 :: Pre-Training Script
 Train an I64 model from scratch in float32.
 After training, call model.quantize_all() for INT8 inference.
 
-Usage:
-    python train.py --model configs/pretrain/default.yaml \
+Single GPU:
+    python train.py --model configs/pretrain/1b.yaml \
                     --data configs/data/pretrain.yaml \
                     --lr 3e-5 --batch-size 32
+
+Multi-GPU (FSDP):
+    torchrun --nproc_per_node=4 train.py \
+        --model configs/pretrain/3b.yaml \
+        --data configs/data/pretrain.yaml \
+        --lr 3e-5 --batch-size 8 --fsdp
+
+Multi-node:
+    torchrun --nnodes=2 --nproc_per_node=4 \
+        --rdzv_backend=c10d --rdzv_endpoint=HOST:PORT \
+        train.py --model configs/pretrain/7b.yaml \
+        --data configs/data/pretrain.yaml --fsdp --bf16
 
 INL - 2025
 """
@@ -20,7 +32,8 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
 from transformers import PreTrainedTokenizerFast, AutoTokenizer
 
 from complexity_i64.models.modeling import I64Model
@@ -32,6 +45,12 @@ from complexity_i64.data.datasets import (
 )
 from complexity_i64.training.trainer import Trainer
 from complexity_i64.training.utils import create_optimizer, create_scheduler
+from complexity_i64.training.distributed import (
+    setup_distributed,
+    cleanup_distributed,
+    is_main_process,
+    wrap_model_fsdp,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,11 +94,25 @@ def main():
     # Resume
     parser.add_argument("--resume", type=str, default=None)
 
+    # Distributed (FSDP)
+    parser.add_argument("--fsdp", action="store_true", help="Enable FSDP distributed training")
+    parser.add_argument("--sharding-strategy", type=str, default="full_shard",
+                        choices=["full_shard", "shard_grad_op", "no_shard"])
+    parser.add_argument("--gradient-checkpointing", action="store_true",
+                        help="Enable gradient checkpointing (saves VRAM)")
+
     # Other
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--token", type=str, default=None, help="HuggingFace token")
 
     args = parser.parse_args()
+
+    # Distributed setup
+    use_distributed = args.fsdp and torch.cuda.is_available()
+    if use_distributed:
+        rank, world_size, local_rank = setup_distributed()
+    else:
+        rank, world_size, local_rank = 0, 1, 0
 
     # Load model config
     with open(args.model) as f:
@@ -90,32 +123,48 @@ def main():
         data_yaml = yaml.safe_load(f)
 
     # Device
-    if args.device == "auto":
+    if use_distributed:
+        device = torch.device(f"cuda:{local_rank}")
+    elif args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
 
-    logger.info("Model config: %s", args.model)
-    logger.info("Data config: %s", args.data)
-    logger.info("Device: %s", device)
-    if torch.cuda.is_available():
-        logger.info("GPU: %s", torch.cuda.get_device_name())
+    if is_main_process():
+        logger.info("Model config: %s", args.model)
+        logger.info("Data config: %s", args.data)
+        logger.info("Device: %s (world_size=%d)", device, world_size)
+        if torch.cuda.is_available():
+            logger.info("GPU: %s", torch.cuda.get_device_name())
 
     # Tokenizer
     if os.path.exists(args.tokenizer):
         tokenizer = PreTrainedTokenizerFast.from_pretrained(args.tokenizer)
     else:
-        logger.warning("Tokenizer not found at %s, using GPT-2", args.tokenizer)
+        if is_main_process():
+            logger.warning("Tokenizer not found at %s, using GPT-2", args.tokenizer)
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
-    logger.info("Vocab size: %d", len(tokenizer))
+    if is_main_process():
+        logger.info("Vocab size: %d", len(tokenizer))
 
     # Model from YAML config
     config = I64Config.from_dict(model_yaml)
     config.vocab_size = model_yaml.get("vocab_size", len(tokenizer))
     model = I64Model(config)
-    model = model.to(device)
-    logger.info("Parameters: %d", model.num_parameters())
+
+    if args.gradient_checkpointing:
+        model.enable_gradient_checkpointing()
+        if is_main_process():
+            logger.info("Gradient checkpointing enabled")
+
+    if use_distributed:
+        model = wrap_model_fsdp(model, bf16=args.bf16, sharding_strategy=args.sharding_strategy)
+    else:
+        model = model.to(device)
+
+    if is_main_process():
+        logger.info("Parameters: %d", sum(p.numel() for p in model.parameters()))
 
     # Optimizer & scheduler
     optimizer = create_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
@@ -132,10 +181,12 @@ def main():
 
     if source == "pretokenized":
         train_dataset = PreTokenizedDataset(data_yaml["data_dir"], max_length=max_length)
+        sampler = DistributedSampler(train_dataset, shuffle=True) if use_distributed else None
         train_loader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            shuffle=True,
+            shuffle=(sampler is None),
+            sampler=sampler,
             collate_fn=collate_fn,
             num_workers=data_yaml.get("num_workers", 4),
             pin_memory=True,
@@ -173,6 +224,7 @@ def main():
         max_grad_norm=args.max_grad_norm,
         log_interval=args.log_interval,
         save_interval=args.save_interval,
+        distributed=use_distributed,
     )
 
     # Resume
@@ -180,8 +232,9 @@ def main():
     if args.resume:
         start_step = trainer.resume(args.resume, lr=args.lr)
 
-    logger.info("Starting training — batch=%d, grad_accum=%d, lr=%.2e, max_steps=%d",
-                args.batch_size, args.gradient_accumulation, args.lr, args.max_steps)
+    if is_main_process():
+        logger.info("Starting training — batch=%d, grad_accum=%d, lr=%.2e, max_steps=%d, gpus=%d",
+                    args.batch_size, args.gradient_accumulation, args.lr, args.max_steps, world_size)
 
     final_step = trainer.train(
         train_loader,
@@ -189,8 +242,17 @@ def main():
         start_step=start_step,
     )
 
-    model.save_pretrained(str(Path(args.checkpoint_dir) / "final"))
-    logger.info("Training complete! Final step: %d", final_step)
+    if is_main_process():
+        # Save final checkpoint — unwrap FSDP if needed
+        if use_distributed:
+            from complexity_i64.training.distributed import save_fsdp_checkpoint
+            save_fsdp_checkpoint(model, optimizer, scheduler, final_step, args.checkpoint_dir)
+        else:
+            model.save_pretrained(str(Path(args.checkpoint_dir) / "final"))
+        logger.info("Training complete! Final step: %d", final_step)
+
+    if use_distributed:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
