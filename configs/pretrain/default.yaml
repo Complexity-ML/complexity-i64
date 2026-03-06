@@ -1,0 +1,37 @@
+model:
+  size: 150m
+  vocab_size: 32000
+
+data:
+  source: streaming          # streaming or pretokenized
+  dataset: roneneldan/TinyStories
+  text_field: text
+  max_length: 512
+  num_workers: 4
+
+training:
+  batch_size: 32
+  gradient_accumulation: 1
+  max_steps: 100000
+  learning_rate: 1e-4
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+
+  # Scheduler
+  scheduler: cosine          # cosine, constant, cosine_restarts
+  warmup_steps: 2000
+  restart_period: 50000
+  restart_mult: 2
+
+  # Precision
+  bf16: false
+  use_amp: true
+
+  # Logging
+  log_interval: 50
+  save_interval: 5000
+
+paths:
+  tokenizer: ./tokenizer
+  checkpoint_dir: ./checkpoints
+  tensorboard_dir: ./runs

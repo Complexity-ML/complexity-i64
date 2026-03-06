@@ -1,0 +1,38 @@
+model:
+  checkpoint: ./checkpoints/final
+  tokenizer: ./tokenizer
+  output: ./checkpoints-sft-lora
+
+training:
+  epochs: 30
+  batch_size: 4
+  gradient_accumulation: 4
+  learning_rate: 2e-5
+  max_length: 2048
+  warmup_ratio: 0.1
+  bf16: true
+
+lora:
+  enabled: true
+  rank: 64
+  alpha: 128
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+
+data:
+  template: default
+  max_samples: 30000
+  datasets:
+    - name: tatsu-lab/alpaca
+      weight: 1.0
+      format: alpaca
+    - name: OpenAssistant/oasst1
+      weight: 1.0
+      format: oasst
+    - name: databricks/databricks-dolly-15k
+      weight: 1.0
+      format: alpaca

@@ -1,25 +1,28 @@
 """
-Complexity-I64 :: Integer-Native Model
+Complexity-I64 :: Model
 
-Same architecture as Complexity Deep, projected into integer:
-- Every matmul → INT8 (torch._int_mm)
-- SiLU, sigmoid, softplus → LUT lookups (zero FLOPs)
-- RMSNorm weights → Q12 INT16
+Train in float32 (standard PyTorch). Deploy in INT8 (quantize_all).
+
+Architecture = Complexity Deep projected into integer:
+- Every matmul → INT8 (torch._int_mm) after quantization
+- SiLU, sigmoid, softplus → LUT lookups (zero FLOPs) after quantization
+- RMSNorm weights → Q12 INT16 after quantization
 - Float only where irreducible: rsqrt, RoPE, softmax
 
-Compatible with complexity-deep checkpoints:
-    1. Load float weights from checkpoint
-    2. Call model.quantize_all() → converts everything to INT8
-    3. Inference runs in integer
+Compatible with complexity-deep checkpoints (same weight names).
 
 INL - 2025
 """
+
+import logging
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 from complexity_i64.models.config import I64Config
 from complexity_i64.core.normalization import I64RMSNorm
@@ -137,9 +140,10 @@ class I64DecoderLayer(nn.Module):
 
 class I64Model(nn.Module):
     """
-    Complexity-I64: Integer-native transformer.
+    Complexity-I64 model.
 
-    Load complexity-deep checkpoint → quantize_all() → pure integer inference.
+    Training: float32 forward/backward (standard PyTorch).
+    Inference: quantize_all() → INT8 matmuls, LUT activations.
     """
 
     def __init__(self, config: I64Config):
@@ -158,14 +162,31 @@ class I64Model(nn.Module):
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        # Tie weights
+        if config.tie_word_embeddings:
+            # lm_head shares embed_tokens weight
+            pass
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module: nn.Module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         velocity_state: Optional[torch.Tensor] = None,
         use_cache: bool = False,
+        **kwargs,
     ) -> I64CausalLMOutput:
 
         hidden = self.embed_tokens(input_ids.long())
@@ -211,7 +232,19 @@ class I64Model(nn.Module):
         # Logits: INT8 if quantized
         logits = self._compute_logits(hidden)
 
+        # Loss
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, self.config.vocab_size),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
         return I64CausalLMOutput(
+            loss=loss,
             logits=logits,
             past_key_values=new_past_key_values,
             velocity_state=velocity,
@@ -249,23 +282,135 @@ class I64Model(nn.Module):
             self.lm_head.weight = None
 
         self.requires_grad_(False)
-        print(f"  Quantized to INT8: {self.num_parameters():,} params")
+        logger.info("Quantized to INT8: %d params", self.num_parameters())
 
-    def num_parameters(self) -> int:
+    def num_parameters(self, trainable_only: bool = False) -> int:
+        if trainable_only:
+            return sum(p.numel() for p in self.parameters() if p.requires_grad)
         return sum(p.numel() for p in self.parameters())
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 100,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        do_sample: bool = True,
+        eos_token_id: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Generate tokens autoregressively with KV cache."""
+        if eos_token_id is None:
+            eos_token_id = self.config.eos_token_id
+
+        past_key_values = None
+        velocity_state = None
+
+        for _ in range(max_new_tokens):
+            if past_key_values is not None:
+                curr_ids = input_ids[:, -1:]
+                if velocity_state is not None:
+                    velocity_state = velocity_state[:, -1:, :]
+            else:
+                curr_ids = input_ids
+
+            outputs = self.forward(
+                curr_ids,
+                past_key_values=past_key_values,
+                velocity_state=velocity_state,
+                use_cache=True,
+            )
+
+            past_key_values = outputs.past_key_values
+            velocity_state = outputs.velocity_state
+
+            raw_logits = outputs.logits[:, -1, :].clone()
+            logits = raw_logits / temperature
+
+            if top_k > 0:
+                indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                logits[indices_to_remove] = float("-inf")
+
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits[indices_to_remove] = float("-inf")
+
+            if do_sample:
+                probs = F.softmax(logits, dim=-1)
+                probs = torch.clamp(probs, min=1e-8)
+                probs = probs / probs.sum(dim=-1, keepdim=True)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(raw_logits, dim=-1, keepdim=True)
+
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+            if (next_token == eos_token_id).all():
+                break
+
+        return input_ids
+
+    def save_pretrained(self, save_path: str):
+        """Save model weights + config.json."""
+        import json
+        from pathlib import Path
+        path = Path(save_path)
+        path.mkdir(parents=True, exist_ok=True)
+        with open(path / "config.json", "w") as f:
+            json.dump(self.config.to_dict(), f, indent=2)
+        torch.save(self.state_dict(), path / "model.pt")
+
+    @classmethod
+    def from_pretrained(cls, load_path: str, device: str = "cpu") -> "I64Model":
+        """Load model from saved checkpoint directory."""
+        import json
+        from pathlib import Path
+        path = Path(load_path)
+        with open(path / "config.json", "r") as f:
+            config_dict = json.load(f)
+        config = I64Config.from_dict(config_dict)
+        model = cls(config)
+        pt_path = path / "model.pt"
+        if pt_path.exists():
+            state_dict = torch.load(pt_path, map_location=device, weights_only=True)
+            model.load_state_dict(state_dict)
+        model = model.to(device)
+        return model
 
     @staticmethod
     def from_complexity_deep(checkpoint_path: str, config: I64Config, device="cpu"):
-        """Load a complexity-deep checkpoint into I64Model and quantize."""
+        """Load a complexity-deep checkpoint and quantize to INT8."""
         model = I64Model(config)
-
-        # Load weights (complexity-deep → i64 mapping is 1:1)
         state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
         if "model_state_dict" in state_dict:
             state_dict = state_dict["model_state_dict"]
-
-        # Remap keys if needed (complexity_deep naming → i64 naming)
         model.load_state_dict(state_dict, strict=False)
         model.to(device)
         model.quantize_all()
         return model
+
+
+# Convenience factory
+def create_i64_model(size: str = "150m", vocab_size: int = 32000) -> I64Model:
+    """Create an I64Model by size preset."""
+    presets = {
+        "tiny": I64Config.i64_tiny,
+        "20m": I64Config.i64_20m,
+        "small": I64Config.i64_small,
+        "150m": I64Config.i64_150m,
+        "350m": I64Config.i64_350m,
+        "1b": I64Config.i64_1b,
+        "3b": I64Config.i64_3b,
+        "7b": I64Config.i64_7b,
+    }
+    factory = presets.get(size)
+    if factory is None:
+        raise ValueError(f"Unknown size '{size}'. Choose from: {list(presets.keys())}")
+    config = factory()
+    config.vocab_size = vocab_size
+    return I64Model(config)

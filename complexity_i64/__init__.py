@@ -1,8 +1,10 @@
 """
 Complexity-I64: Integer-native transformer architecture.
 
-Every matmul is INT8. Float only where mathematically irreducible
-(RoPE rotation, attention softmax, RMSNorm rsqrt).
+Train in float32. Deploy in INT8.
 
 INL - 2025
 """
+
+from complexity_i64.models.config import I64Config
+from complexity_i64.models.modeling import I64Model, create_i64_model
