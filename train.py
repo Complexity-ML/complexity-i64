@@ -90,6 +90,9 @@ def main():
     parser.add_argument("--tensorboard-dir", type=str, default="./runs")
     parser.add_argument("--log-interval", type=int, default=50)
     parser.add_argument("--save-interval", type=int, default=5000)
+    parser.add_argument("--eval-interval", type=int, default=1000)
+    parser.add_argument("--eval-data", type=str, default=None,
+                        help="Eval dataset YAML (same format as --data)")
 
     # Resume
     parser.add_argument("--resume", type=str, default=None)
@@ -208,6 +211,43 @@ def main():
             num_workers=0,
         )
 
+    # Eval dataset (optional)
+    eval_loader = None
+    if args.eval_data:
+        with open(args.eval_data) as f:
+            eval_yaml = yaml.safe_load(f)
+        eval_source = eval_yaml.get("source", "streaming")
+        eval_max_length = eval_yaml.get("max_length", max_length)
+
+        if eval_source == "pretokenized":
+            eval_dataset = PreTokenizedDataset(eval_yaml["data_dir"], max_length=eval_max_length)
+            eval_loader = DataLoader(
+                eval_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                collate_fn=collate_fn,
+                num_workers=eval_yaml.get("num_workers", 2),
+                pin_memory=True,
+            )
+        else:
+            eval_dataset = StreamingTextDataset(
+                dataset_name=eval_yaml["dataset"],
+                tokenizer=tokenizer,
+                max_length=eval_max_length,
+                text_field=eval_yaml.get("text_field", "text"),
+                subset=eval_yaml.get("subset", None),
+                split=eval_yaml.get("split", "validation"),
+                token=args.token,
+            )
+            eval_loader = DataLoader(
+                eval_dataset,
+                batch_size=args.batch_size,
+                collate_fn=collate_fn,
+                num_workers=0,
+            )
+        if is_main_process():
+            logger.info("Eval dataset: %s", args.eval_data)
+
     # Trainer
     run_name = f"i64_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     trainer = Trainer(
@@ -240,6 +280,8 @@ def main():
         train_loader,
         max_steps=args.max_steps,
         start_step=start_step,
+        eval_loader=eval_loader,
+        eval_interval=args.eval_interval,
     )
 
     if is_main_process():

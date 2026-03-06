@@ -172,3 +172,7 @@ class I64TokenRoutedMLP(nn.Module):
         self.register_buffer("gate_up_scale", torch.stack(gu_s))
         self.register_buffer("down_int8", torch.stack(dn_q))
         self.register_buffer("down_scale", torch.stack(dn_s))
+
+        # Free float weights
+        self.gate_up_proj = None
+        self.down_proj = None

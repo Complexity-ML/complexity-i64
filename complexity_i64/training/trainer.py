@@ -168,7 +168,8 @@ class Trainer:
             total_loss = 0.0
             num_batches = 0
 
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}")
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}",
+                        disable=not is_main_process())
             self.optimizer.zero_grad()
 
             for batch_idx, batch in enumerate(pbar):
@@ -186,20 +187,23 @@ class Trainer:
                     total_loss += loss
                     num_batches += 1
 
-                    if self.global_step % 10 == 0:
+                    if self.global_step % 10 == 0 and is_main_process():
                         current_loss = loss
                         ppl = math.exp(min(current_loss, 20))
                         lr = self.scheduler.get_last_lr()[0]
                         pbar.set_postfix(loss=f"{current_loss:.4f}", ppl=f"{ppl:.2f}", lr=f"{lr:.2e}")
-                        self.writer.add_scalar("train/loss", current_loss, self.global_step)
-                        self.writer.add_scalar("train/perplexity", ppl, self.global_step)
-                        self.writer.add_scalar("train/lr", lr, self.global_step)
+                        if self.writer:
+                            self.writer.add_scalar("train/loss", current_loss, self.global_step)
+                            self.writer.add_scalar("train/perplexity", ppl, self.global_step)
+                            self.writer.add_scalar("train/lr", lr, self.global_step)
 
             # End of epoch
             avg_loss = total_loss / max(num_batches, 1)
             ppl = math.exp(min(avg_loss, 20))
-            logger.info("Epoch %d — loss: %.4f, ppl: %.2f", epoch + 1, avg_loss, ppl)
-            self.writer.add_scalar("epoch/loss", avg_loss, epoch)
+            if is_main_process():
+                logger.info("Epoch %d — loss: %.4f, ppl: %.2f", epoch + 1, avg_loss, ppl)
+                if self.writer:
+                    self.writer.add_scalar("epoch/loss", avg_loss, epoch)
 
             if eval_loader:
                 self._evaluate(eval_loader)
@@ -292,7 +296,8 @@ class Trainer:
         num_batches = 0
 
         with torch.no_grad():
-            for batch in tqdm(eval_loader, desc="Evaluating", leave=False):
+            for batch in tqdm(eval_loader, desc="Evaluating", leave=False,
+                              disable=not is_main_process()):
                 if batch is None:
                     continue
                 input_ids = batch["input_ids"].to(self.device)
@@ -309,10 +314,17 @@ class Trainer:
                     num_batches += 1
 
         avg_loss = total_loss / max(num_batches, 1)
+
+        if self.distributed:
+            loss_tensor = torch.tensor(avg_loss, device=self.device)
+            avg_loss = reduce_mean(loss_tensor).item()
+
         ppl = math.exp(min(avg_loss, 20))
-        logger.info("Eval — loss: %.4f, ppl: %.2f", avg_loss, ppl)
-        self.writer.add_scalar("eval/loss", avg_loss, self.global_step)
-        self.writer.add_scalar("eval/perplexity", ppl, self.global_step)
+        if is_main_process():
+            logger.info("Eval — loss: %.4f, ppl: %.2f", avg_loss, ppl)
+            if self.writer:
+                self.writer.add_scalar("eval/loss", avg_loss, self.global_step)
+                self.writer.add_scalar("eval/perplexity", ppl, self.global_step)
 
     def _save_checkpoint(self, tag: Optional[str] = None):
         """Save checkpoint (FSDP-aware: gathers full state to rank 0)."""

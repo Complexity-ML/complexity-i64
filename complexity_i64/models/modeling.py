@@ -65,6 +65,7 @@ class I64DecoderLayer(nn.Module):
             max_position_embeddings=config.max_position_embeddings,
             rope_theta=config.rope_theta,
             use_qk_norm=config.use_qk_norm,
+            attention_dropout=config.attention_dropout,
         )
 
         self.dynamics = I64Dynamics(
@@ -295,6 +296,10 @@ class I64Model(nn.Module):
             wq, ws = quantize_weight_int8(self.embed_tokens.weight.data)
             self.register_buffer("embed_int8", wq)
             self.register_buffer("embed_scale", ws)
+            # Downcast embedding to float16 to save memory (inference only)
+            self.embed_tokens.weight = nn.Parameter(
+                self.embed_tokens.weight.data.half(), requires_grad=False,
+            )
         elif hasattr(self, 'lm_head'):
             wq, ws = quantize_weight_int8(self.lm_head.weight.data)
             self.register_buffer("lm_head_int8", wq)
@@ -384,6 +389,17 @@ class I64Model(nn.Module):
         with open(path / "config.json", "w") as f:
             json.dump(self.config.to_dict(), f, indent=2)
         torch.save(self.state_dict(), path / "model.pt")
+
+    @classmethod
+    def from_fsdp_checkpoint(cls, checkpoint_path: str, config_path: str, device: str = "cpu") -> "I64Model":
+        """Load a model from an FSDP training checkpoint (step_N.pt or last.pt)."""
+        config = I64Config.from_yaml(config_path)
+        model = cls(config)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        model.load_state_dict(state_dict, strict=False)
+        model = model.to(device)
+        return model
 
     @classmethod
     def from_pretrained(cls, load_path: str, device: str = "cpu") -> "I64Model":

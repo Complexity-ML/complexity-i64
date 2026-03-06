@@ -34,6 +34,7 @@ class I64Attention(nn.Module):
         max_position_embeddings: int = 2048,
         rope_theta: float = 10000.0,
         use_qk_norm: bool = True,
+        attention_dropout: float = 0.0,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -41,6 +42,7 @@ class I64Attention(nn.Module):
         self.num_kv_heads = num_key_value_heads
         self.head_dim = hidden_size // num_attention_heads
         self.num_kv_groups = num_attention_heads // num_key_value_heads
+        self.attention_dropout = attention_dropout
 
         # QKV projections (will be fused + quantized)
         self.q_proj = nn.Linear(hidden_size, num_attention_heads * self.head_dim, bias=False)
@@ -167,8 +169,11 @@ class I64Attention(nn.Module):
 
         # Attention (float — softmax is irreducible)
         # Always use causal masking; attention_mask handles padding on top
+        dropout_p = self.attention_dropout if self.training else 0.0
         attn_output = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attention_mask, is_causal=(attention_mask is None and past_key_value is None),
+            q, k, v, attn_mask=attention_mask,
+            dropout_p=dropout_p,
+            is_causal=(attention_mask is None and past_key_value is None),
         )
 
         # O projection (INT8)
