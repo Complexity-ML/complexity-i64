@@ -71,10 +71,16 @@ class I64Attention(nn.Module):
         self._max_pos = max_pos
 
     def _apply_rope(self, q, k, positions):
-        """RoPE — float, irreducible."""
-        freqs = torch.outer(positions.float(), self.inv_freq.to(positions.device))
-        cos = freqs.cos().unsqueeze(1)
-        sin = freqs.sin().unsqueeze(1)
+        """RoPE — float, irreducible. q,k: (batch, heads, seq, head_dim)."""
+        # positions: (batch, seq) or (seq,) — use first batch's positions (same for all)
+        if positions.dim() == 2:
+            pos = positions[0].float()
+        else:
+            pos = positions.float()
+        freqs = torch.outer(pos, self.inv_freq.to(q.device))
+        # (seq, head_dim//2) -> (1, 1, seq, head_dim//2) for broadcast
+        cos = freqs.cos().unsqueeze(0).unsqueeze(0)
+        sin = freqs.sin().unsqueeze(0).unsqueeze(0)
 
         def rotate(x, cos, sin):
             x1 = x[..., :x.shape[-1] // 2]
@@ -107,7 +113,7 @@ class I64Attention(nn.Module):
 
         return q, k, v
 
-    def _o_proj(self, out):
+    def _o_proj_forward(self, out):
         """O projection — INT8 if quantized."""
         if hasattr(self, 'o_int8'):
             return int8_linear(out, self.o_int8, self.o_scale)
@@ -147,7 +153,7 @@ class I64Attention(nn.Module):
             k = self.k_norm(k)
 
         # RoPE (float — irreducible)
-        q, k = self._apply_rope(q, k, positions.view(-1))
+        q, k = self._apply_rope(q, k, positions)
 
         # KV cache
         if past_key_value is not None:
@@ -160,13 +166,14 @@ class I64Attention(nn.Module):
         v = v.repeat_interleave(self.num_kv_groups, dim=1)
 
         # Attention (float — softmax is irreducible)
+        # Always use causal masking; attention_mask handles padding on top
         attn_output = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attention_mask, is_causal=(attention_mask is None),
+            q, k, v, attn_mask=attention_mask, is_causal=(attention_mask is None and past_key_value is None),
         )
 
         # O projection (INT8)
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
-        out = self._o_proj(attn_output.reshape(-1, self.num_heads * self.head_dim))
+        out = self._o_proj_forward(attn_output.reshape(-1, self.num_heads * self.head_dim))
         out = out.view(bsz, seq_len, self.hidden_size)
 
         if is_2d:
@@ -202,10 +209,11 @@ class I64Attention(nn.Module):
         self.register_buffer("o_scale", o_s)
 
         # Free float weights
-        self.q_proj.weight = None
-        self.k_proj.weight = None
-        self.v_proj.weight = None
-        self.o_proj.weight = None
-        self.mu_to_q.weight = None
-        self.mu_to_k.weight = None
-        self.mu_to_v.weight = None
+        del self.q_proj
+        del self.k_proj
+        del self.v_proj
+        del self.mu_to_q
+        del self.mu_to_k
+        del self.mu_to_v
+        # Keep o_proj deleted separately (its forward is handled by _o_proj_forward)
+        del self.o_proj

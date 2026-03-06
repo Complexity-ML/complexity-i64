@@ -217,11 +217,14 @@ class I64Model(nn.Module):
                 use_cache=use_cache,
             )
 
-            # Mu Residual Highway
+            # Mu Residual Highway (EMA + norm clamp to prevent divergence)
             if mu_residual is None:
-                mu_residual = mu_current.clone()
+                mu_residual = mu_current
             else:
-                mu_residual = mu_residual + mu_current
+                mu_residual = 0.9 * mu_residual + 0.1 * mu_current
+            # Norm clamp: preserve direction, bound magnitude
+            mu_norm = mu_residual.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            mu_residual = torch.where(mu_norm > 10.0, mu_residual * (10.0 / mu_norm), mu_residual)
             mu_prev = mu_current + 0.1 * mu_residual
 
             if use_cache:
@@ -279,7 +282,7 @@ class I64Model(nn.Module):
             wq, ws = quantize_weight_int8(self.lm_head.weight.data)
             self.register_buffer("lm_head_int8", wq)
             self.register_buffer("lm_head_scale", ws)
-            self.lm_head.weight = None
+            del self.lm_head
 
         self.requires_grad_(False)
         logger.info("Quantized to INT8: %d params", self.num_parameters())
@@ -396,21 +399,12 @@ class I64Model(nn.Module):
 
 
 # Convenience factory
-def create_i64_model(size: str = "150m", vocab_size: int = 32000) -> I64Model:
-    """Create an I64Model by size preset."""
-    presets = {
-        "tiny": I64Config.i64_tiny,
-        "20m": I64Config.i64_20m,
-        "small": I64Config.i64_small,
-        "150m": I64Config.i64_150m,
-        "350m": I64Config.i64_350m,
-        "1b": I64Config.i64_1b,
-        "3b": I64Config.i64_3b,
-        "7b": I64Config.i64_7b,
-    }
-    factory = presets.get(size)
-    if factory is None:
-        raise ValueError(f"Unknown size '{size}'. Choose from: {list(presets.keys())}")
-    config = factory()
-    config.vocab_size = vocab_size
+def create_i64_model(config_path: str, vocab_size: Optional[int] = None) -> I64Model:
+    """Create an I64Model from a YAML config file."""
+    import yaml
+    with open(config_path) as f:
+        model_yaml = yaml.safe_load(f)["model"]
+    config = I64Config.from_dict(model_yaml)
+    if vocab_size is not None:
+        config.vocab_size = vocab_size
     return I64Model(config)

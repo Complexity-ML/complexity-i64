@@ -65,13 +65,13 @@ class I64Dynamics(nn.Module):
         # Controller: INT8 matmuls + LUT SiLU
         if hasattr(self, 'ctrl_in_int8'):
             ctrl = int8_linear(hv, self.ctrl_in_int8, self.ctrl_in_scale,
-                               self.controller_in.bias)
+                               self.ctrl_in_bias)
             # SiLU via LUT
             from complexity_i64.core.integer_ops import silu_integer
             ctrl_q7 = (ctrl.float() * _Q7).round().to(torch.int32)
             ctrl = silu_integer(ctrl_q7).float() / _Q7
             ctrl_out = int8_linear(ctrl, self.ctrl_out_int8, self.ctrl_out_scale,
-                                   self.controller_out.bias)
+                                   self.ctrl_out_bias)
         else:
             import torch.nn.functional as F
             ctrl = F.silu(self.controller_in(hv))
@@ -126,7 +126,9 @@ class I64Dynamics(nn.Module):
         self.register_buffer("mu_proj_int8", mpq)
         self.register_buffer("mu_proj_scale", mps)
 
-        # Free float weights (keep biases)
-        self.controller_in.weight = None
-        self.controller_out.weight = None
-        self.mu_proj.weight = None
+        # Free float weights (keep biases as standalone buffers)
+        self.register_buffer("ctrl_in_bias", self.controller_in.bias.data.clone())
+        self.register_buffer("ctrl_out_bias", self.controller_out.bias.data.clone())
+        del self.controller_in
+        del self.controller_out
+        del self.mu_proj

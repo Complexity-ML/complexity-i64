@@ -121,7 +121,7 @@ class Trainer:
 
             if (batch_idx + 1) % self.gradient_accumulation == 0:
                 self._optimizer_step()
-                total_loss += accum_loss * self.gradient_accumulation
+                total_loss += accum_loss
                 accum_loss = 0.0
                 self.global_step += 1
                 pbar.update(1)
@@ -167,11 +167,11 @@ class Trainer:
                     self._optimizer_step()
                     self.global_step += 1
 
-                    total_loss += loss * self.gradient_accumulation
+                    total_loss += loss
                     num_batches += 1
 
                     if self.global_step % 10 == 0:
-                        current_loss = loss * self.gradient_accumulation
+                        current_loss = loss
                         ppl = math.exp(min(current_loss, 20))
                         lr = self.scheduler.get_last_lr()[0]
                         pbar.set_postfix(loss=f"{current_loss:.4f}", ppl=f"{ppl:.2f}", lr=f"{lr:.2e}")
@@ -248,7 +248,7 @@ class Trainer:
 
         batch_size = batch["input_ids"].shape[0]
         seq_len = batch["input_ids"].shape[1]
-        tokens_per_sec = (self.global_step * batch_size * seq_len) / max(elapsed, 1)
+        tokens_per_sec = (self.global_step * self.gradient_accumulation * batch_size * seq_len) / max(elapsed, 1)
 
         self.writer.add_scalar("train/loss", avg_loss, self.global_step)
         self.writer.add_scalar("train/perplexity", ppl, self.global_step)

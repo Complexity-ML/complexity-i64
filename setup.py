@@ -20,5 +20,6 @@ setup(
     extras_require={
         "lora": ["peft>=0.7.0"],
         "triton": ["triton>=2.0.0"],
+        "tokenizer": ["complexity-framework"],
     },
 )

@@ -66,9 +66,9 @@ class I64MLP(nn.Module):
         self.register_buffer("down_scale", ds)
 
         # Free float weights
-        self.gate_proj.weight = None
-        self.up_proj.weight = None
-        self.down_proj.weight = None
+        del self.gate_proj
+        del self.up_proj
+        del self.down_proj
 
 
 class I64TokenRoutedMLP(nn.Module):

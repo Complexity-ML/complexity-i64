@@ -92,56 +92,10 @@ class I64Config:
         filtered = {k: v for k, v in config_dict.items() if k in valid_params}
         return cls(**filtered)
 
-    # ========================================================================
-    # PRESETS (vocab_size=32000 for all)
-    # ========================================================================
-
     @classmethod
-    def i64_tiny(cls) -> "I64Config":
-        """~15M params - debugging."""
-        return cls(hidden_size=256, intermediate_size=704,
-                   num_hidden_layers=6, num_attention_heads=4, num_key_value_heads=2)
-
-    @classmethod
-    def i64_20m(cls) -> "I64Config":
-        """~20M params - quick experiments."""
-        return cls(hidden_size=320, intermediate_size=896,
-                   num_hidden_layers=8, num_attention_heads=8, num_key_value_heads=4)
-
-    @classmethod
-    def i64_small(cls) -> "I64Config":
-        """~50M params."""
-        return cls(hidden_size=512, intermediate_size=1408,
-                   num_hidden_layers=8, num_attention_heads=8, num_key_value_heads=4)
-
-    @classmethod
-    def i64_150m(cls) -> "I64Config":
-        """~150M params."""
-        return cls(hidden_size=768, intermediate_size=2048,
-                   num_hidden_layers=12, num_attention_heads=12, num_key_value_heads=4)
-
-    @classmethod
-    def i64_350m(cls) -> "I64Config":
-        """~350M params."""
-        return cls(hidden_size=1280, intermediate_size=3456,
-                   num_hidden_layers=20, num_attention_heads=16, num_key_value_heads=4)
-
-    @classmethod
-    def i64_1b(cls) -> "I64Config":
-        """~1B params."""
-        return cls(hidden_size=2048, intermediate_size=5632,
-                   num_hidden_layers=24, num_attention_heads=16, num_key_value_heads=8)
-
-    @classmethod
-    def i64_3b(cls) -> "I64Config":
-        """~3B params."""
-        return cls(hidden_size=2560, intermediate_size=6912,
-                   num_hidden_layers=32, num_attention_heads=32, num_key_value_heads=8,
-                   num_experts=8)
-
-    @classmethod
-    def i64_7b(cls) -> "I64Config":
-        """~7B params."""
-        return cls(hidden_size=4096, intermediate_size=11008,
-                   num_hidden_layers=32, num_attention_heads=32, num_key_value_heads=8,
-                   num_experts=8)
+    def from_yaml(cls, path: str) -> "I64Config":
+        """Load config from a YAML file (configs/pretrain/*.yaml)."""
+        import yaml
+        with open(path) as f:
+            data = yaml.safe_load(f)["model"]
+        return cls.from_dict(data)
